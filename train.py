@@ -8,11 +8,10 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
 
 from data import data_loader
-from utils import get_dset_path
-from utils import relative_to_abs
-from utils import gan_g_loss, gan_d_loss, l2_loss, displacement_error, final_displacement_error
+from utils import get_dset_path, relative_to_abs, l2_loss, displacement_error, final_displacement_error
 from models import TrajectoryGenerator, TrajectoryDiscriminator
 
 from constants import *
@@ -23,220 +22,225 @@ def init_weights(m):
         nn.init.kaiming_normal_(m.weight)
 
 def get_dtypes():
-    return torch.cuda.LongTensor, torch.cuda.FloatTensor
+    return torch.LongTensor, torch.FloatTensor
 
 def main():
-    train_path = get_dset_path(DATASET_NAME, 'train')
-    val_path = get_dset_path(DATASET_NAME, 'val')
-    long_dtype, float_dtype = get_dtypes()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("Initializing train dataset")
-    train_dset, train_loader = data_loader(train_path)
-    print("Initializing val dataset")
-    _, val_loader = data_loader(val_path)
+    for DATASET_NAME in DATASET_LIST:
+        train_path = get_dset_path(DATASET_NAME, 'train')
+        val_path = get_dset_path(DATASET_NAME, 'val')
+        long_dtype, float_dtype = get_dtypes()
 
-    iterations_per_epoch = len(train_dset) / D_STEPS
-    NUM_ITERATIONS = int(iterations_per_epoch * NUM_EPOCHS)
-    print('There are {} iterations per epoch'.format(iterations_per_epoch))
+        print(f"\nInitializing train dataset: {DATASET_NAME}")
+        train_dset, train_loader = data_loader(train_path)
+        print(f"Initializing val dataset: {DATASET_NAME}")
+        _, val_loader = data_loader(val_path)
 
-    generator = TrajectoryGenerator()
-    generator.apply(init_weights)
-    generator.type(float_dtype).train()
-    print('Here is the generator:')
-    print(generator)
+        iterations_per_epoch = len(train_dset) / D_STEPS
+        print(f'There are {iterations_per_epoch:.1f} iterations per epoch')
 
-    discriminator = TrajectoryDiscriminator()
-    discriminator.apply(init_weights)
-    discriminator.type(float_dtype).train()
-    print('Here is the discriminator:')
-    print(discriminator)
+        generator = TrajectoryGenerator().to(device)
+        generator.apply(init_weights)
+        generator.train()
+        print('Here is the generator:')
+        print(generator)
 
-    optimizer_g = optim.Adam(generator.parameters(), lr=G_LR)
-    optimizer_d = optim.Adam(discriminator.parameters(), lr=D_LR)
+        discriminator = TrajectoryDiscriminator().to(device)
+        discriminator.apply(init_weights)
+        discriminator.train()
+        print('Here is the discriminator:')
+        print(discriminator)
 
-    t, epoch = 0, 0
-    t0 = None
-    min_ade = None
-    while t < NUM_ITERATIONS:
-        gc.collect()
-        d_steps_left = D_STEPS
-        g_steps_left = G_STEPS
-        epoch += 1
-        print('Starting epoch {}'.format(epoch))
-        for batch in train_loader:
+        optimizer_g = optim.Adam(
+            generator.parameters(),
+            lr=G_LR,
+            betas=(0.5, 0.9),
+            weight_decay=1e-5
+        )
+        optimizer_d = optim.Adam(
+            discriminator.parameters(),
+            lr=D_LR * 4,
+            betas=(0.5, 0.9),
+            weight_decay=1e-5
+        )
 
-            if d_steps_left > 0:
-                losses_d = discriminator_step(batch, generator,
-                                              discriminator, gan_d_loss,
-                                              optimizer_d)
-                d_steps_left -= 1
-            elif g_steps_left > 0:
-                losses_g = generator_step(batch, generator,
-                                          discriminator, gan_g_loss,
-                                          optimizer_g)
-                g_steps_left -= 1
+        def lr_lambda(current_step):
+            if current_step < NUM_ITERATIONS / 3:
+                return 1.0
+            elif current_step < 2 * NUM_ITERATIONS / 3:
+                return 0.5
+            else:
+                return 0.25
 
-            if d_steps_left > 0 or g_steps_left > 0:
-                continue
+        scheduler_g = LambdaLR(optimizer_g, lr_lambda=lr_lambda)
+        scheduler_d = LambdaLR(optimizer_d, lr_lambda=lr_lambda)
 
-            if t % PRINT_EVERY == 0:
-                print('t = {} / {}'.format(t + 1, NUM_ITERATIONS))
-                for k, v in sorted(losses_d.items()):
-                    print('  [D] {}: {:.3f}'.format(k, v))
-                for k, v in sorted(losses_g.items()):
-                    print('  [G] {}: {:.3f}'.format(k, v))
+        t, epoch = 0, 0
+        min_ade = None
 
-                print('Checking stats on val ...')
-                metrics_val = check_accuracy(val_loader, generator, discriminator, gan_d_loss)
-                
-                print('Checking stats on train ...')
-                metrics_train = check_accuracy(train_loader, generator, discriminator, gan_d_loss, limit=True)
-
-                for k, v in sorted(metrics_val.items()):
-                    print('  [val] {}: {:.3f}'.format(k, v))
-                for k, v in sorted(metrics_train.items()):
-                    print('  [train] {}: {:.3f}'.format(k, v))
-
-                if min_ade is None or metrics_val['ade'] < min_ade:
-                    min_ade = metrics_val['ade']
-                    checkpoint = {'t': t, 'g': generator.state_dict(), 'd': discriminator.state_dict(), 'g_optim': optimizer_g.state_dict(), 'd_optim': optimizer_d.state_dict()}
-                    print("Saving checkpoint to model.pt")
-                    torch.save(checkpoint, "model.pt")
-                    print("Done.")
-
-            t += 1
+        while t < NUM_ITERATIONS:
+            gc.collect()
             d_steps_left = D_STEPS
             g_steps_left = G_STEPS
-            if t >= NUM_ITERATIONS:
-                break
+            epoch += 1
+            print(f'Starting epoch {epoch}')
+            for batch in train_loader:
+                batch = [tensor.to(device) for tensor in batch]
 
-def discriminator_step(batch, generator, discriminator, d_loss_fn, optimizer_d):
-    
-    batch = [tensor.cuda() for tensor in batch]
-    (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, vgg_list) = batch
-    losses = {}
-    loss = torch.zeros(1).to(pred_traj_gt)
+                if d_steps_left > 0:
+                    losses_d = discriminator_step(batch, generator, discriminator, optimizer_d, device)
+                    d_steps_left -= 1
+                elif g_steps_left > 0:
+                    losses_g = generator_step(batch, generator, discriminator, optimizer_g, device)
+                    g_steps_left -= 1
 
-    generator_out = generator(obs_traj, obs_traj_rel, vgg_list)
+                if d_steps_left > 0 or g_steps_left > 0:
+                    continue
 
-    pred_traj_fake_rel = generator_out
-    pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1, :, 0, :])
+                if t % PRINT_EVERY == 0:
+                    print(f't = {t+1} / {NUM_ITERATIONS}')
+                    for k, v in sorted(losses_d.items()):
+                        print(f'  [D] {k}: {v:.3f}')
+                    for k, v in sorted(losses_g.items()):
+                        print(f'  [G] {k}: {v:.3f}')
 
-    traj_real = torch.cat([obs_traj[:, :, 0, :], pred_traj_gt], dim=0)
-    traj_real_rel = torch.cat([obs_traj_rel[:, :, 0, :], pred_traj_gt_rel], dim=0)
-    traj_fake = torch.cat([obs_traj[:, :, 0, :], pred_traj_fake], dim=0)
-    traj_fake_rel = torch.cat([obs_traj_rel[:, :, 0, :], pred_traj_fake_rel], dim=0)
+                    print('Checking stats on val ...')
+                    metrics_val = check_accuracy(val_loader, generator, discriminator, device)
 
-    scores_fake = discriminator(traj_fake, traj_fake_rel)
-    scores_real = discriminator(traj_real, traj_real_rel)
+                    print('Checking stats on train ...')
+                    metrics_train = check_accuracy(train_loader, generator, discriminator, device, limit=True)
 
-    data_loss = d_loss_fn(scores_real, scores_fake)
-    losses['D_data_loss'] = data_loss.item()
-    loss += data_loss
-    losses['D_total_loss'] = loss.item()
+                    for k, v in sorted(metrics_val.items()):
+                        print(f'  [val] {k}: {v:.3f}')
+                    for k, v in sorted(metrics_train.items()):
+                        print(f'  [train] {k}: {v:.3f}')
+
+                    checkpoint = {
+                        't': t,
+                        'g': generator.state_dict(),
+                        'd': discriminator.state_dict(),
+                        'g_optim': optimizer_g.state_dict(),
+                        'd_optim': optimizer_d.state_dict()
+                    }
+                    print(f"Saving checkpoint to ./models/{DATASET_NAME}_iter{t}_model.pt")
+                    torch.save(checkpoint, f"./models/{DATASET_NAME}_iter{t}_model.pt")
+                    print("Done.")
+
+                scheduler_g.step()
+                scheduler_d.step()
+                t += 1
+                d_steps_left = D_STEPS
+                g_steps_left = G_STEPS
+                if t >= NUM_ITERATIONS:
+                    break
+
+        final_checkpoint = {
+            't': t,
+            'g': generator.state_dict(),
+            'd': discriminator.state_dict(),
+            'g_optim': optimizer_g.state_dict(),
+            'd_optim': optimizer_d.state_dict()
+        }
+        print(f"\nSaving final model to ./models/{DATASET_NAME}_model.pt")
+        torch.save(final_checkpoint, f"./models/{DATASET_NAME}_model.pt")
+        print("Final model saved.")
+
+def discriminator_step(batch, generator, discriminator, optimizer_d, device):
+    obs, pred_gt, obs_rel, pred_gt_rel, vgg = batch
+    with torch.no_grad():
+        fake_rel = generator(obs, obs_rel, vgg)
+        fake_abs = relative_to_abs(fake_rel, obs[-1, :, 0, :])
+
+    real_abs = torch.cat([obs[:, :, 0, :], pred_gt], dim=0)
+    real_rel = torch.cat([obs_rel[:, :, 0, :], pred_gt_rel], dim=0)
+    fake_seq_abs = torch.cat([obs[:, :, 0, :], fake_abs], dim=0)
+    fake_seq_rel = torch.cat([obs_rel[:, :, 0, :], fake_rel], dim=0)
+
+    scores_real = discriminator(real_abs, real_rel)
+    scores_fake = discriminator(fake_seq_abs, fake_seq_rel)
+
+    loss_real = torch.relu(1.0 - scores_real).mean()
+    loss_fake = torch.relu(1.0 + scores_fake).mean()
+    d_loss = 0.5 * (loss_real + loss_fake)
+
+    losses = {'D_data_loss': d_loss.item(), 'D_total_loss': d_loss.item()}
 
     optimizer_d.zero_grad()
-    loss.backward()
+    d_loss.backward()
+    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
     optimizer_d.step()
+
     return losses
 
-def generator_step(batch, generator, discriminator, g_loss_fn, optimizer_g):
+def generator_step(batch, generator, discriminator, optimizer_g, device):
+    obs, pred_gt, obs_rel, pred_gt_rel, vgg = batch
+    g_l2_terms = [l2_loss(generator(obs, obs_rel, vgg), pred_gt_rel, mode='raw') for _ in range(BEST_K)]
+    g_l2_stack = torch.stack(g_l2_terms, dim=1)
+    best_l2 = torch.min(g_l2_stack.sum(dim=0)) / (obs.size(1) * PRED_LEN)
 
-    batch = [tensor.cuda() for tensor in batch]
-    (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, vgg_list) = batch
-    losses = {}
-    loss = torch.zeros(1).to(pred_traj_gt)
-    
-    g_l2_loss_rel = []
-    for _ in range(BEST_K):
-        generator_out = generator(obs_traj, obs_traj_rel, vgg_list)
+    with torch.no_grad():
+        fake_rel = generator(obs, obs_rel, vgg)
+        fake_abs = relative_to_abs(fake_rel, obs[-1, :, 0, :])
+    fake_seq_abs = torch.cat([obs[:, :, 0, :], fake_abs], dim=0)
+    fake_seq_rel = torch.cat([obs_rel[:, :, 0, :], fake_rel], dim=0)
+    scores_fake = discriminator(fake_seq_abs, fake_seq_rel)
 
-        pred_traj_fake_rel = generator_out
-        pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1, :, 0, :])
+    g_adv = -scores_fake.mean()
+    g_loss = best_l2 + g_adv
 
-        g_l2_loss_rel.append(l2_loss(
-            pred_traj_fake_rel,
-            pred_traj_gt_rel,
-            mode='raw'))
-
-    npeds = obs_traj.size(1)
-    g_l2_loss_sum_rel = torch.zeros(1).to(pred_traj_gt)
-    g_l2_loss_rel = torch.stack(g_l2_loss_rel, dim=1)
-    _g_l2_loss_rel = torch.sum(g_l2_loss_rel, dim=0)
-    _g_l2_loss_rel = torch.min(_g_l2_loss_rel) / (npeds*PRED_LEN)
-    g_l2_loss_sum_rel += _g_l2_loss_rel
-    losses['G_l2_loss_rel'] = g_l2_loss_sum_rel.item()
-    loss += g_l2_loss_sum_rel
-
-    traj_fake = torch.cat([obs_traj[:, :, 0, :], pred_traj_fake], dim=0)
-    traj_fake_rel = torch.cat([obs_traj_rel[:, :, 0, :], pred_traj_fake_rel], dim=0)
-
-    scores_fake = discriminator(traj_fake, traj_fake_rel)
-    discriminator_loss = g_loss_fn(scores_fake)
-
-    loss += discriminator_loss
-    losses['G_discriminator_loss'] = discriminator_loss.item()
-    losses['G_total_loss'] = loss.item()
+    losses = {
+        'G_l2_loss_rel': best_l2.item(),
+        'G_discriminator_loss': g_adv.item(),
+        'G_total_loss': g_loss.item()
+    }
 
     optimizer_g.zero_grad()
-    loss.backward()
+    g_loss.backward()
+    torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
     optimizer_g.step()
 
     return losses
 
-def check_accuracy(loader, generator, discriminator, d_loss_fn, limit=False):
-    
-    d_losses = []
-    metrics = {}
-    g_l2_losses_abs, g_l2_losses_rel = ([],) * 2
-    disp_error = []
-    f_disp_error = []
-    total_traj = 0
+def check_accuracy(loader, generator, discriminator, device, limit=False):
+    d_losses, g_l2_abs, g_l2_rel, disp_err, f_disp_err = [], [], [], [], []
+    total, mask_sum = 0, 0
 
-    mask_sum = 0
     generator.eval()
     with torch.no_grad():
         for batch in loader:
-            batch = [tensor.cuda() for tensor in batch]
-            (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, vgg_list) = batch
+            obs, pred_gt, obs_rel, pred_gt_rel, vgg = [t.to(device) for t in batch]
 
-            pred_traj_fake_rel = generator(obs_traj, obs_traj_rel, vgg_list)
-            pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1, :, 0, :])
+            fake_rel = generator(obs, obs_rel, vgg)
+            fake_abs = relative_to_abs(fake_rel, obs[-1, :, 0, :])
 
-            g_l2_loss_abs = l2_loss(pred_traj_fake, pred_traj_gt, mode='sum')
-            g_l2_loss_rel = l2_loss(pred_traj_fake_rel, pred_traj_gt_rel, mode='sum')
+            g_l2_abs.append(l2_loss(fake_abs, pred_gt, mode='sum').item())
+            g_l2_rel.append(l2_loss(fake_rel, pred_gt_rel, mode='sum').item())
+            disp_err.append(displacement_error(fake_abs, pred_gt).item())
+            f_disp_err.append(final_displacement_error(fake_abs[-1], pred_gt[-1]).item())
 
-            ade = displacement_error(pred_traj_fake, pred_traj_gt)
-            fde = final_displacement_error(pred_traj_fake[-1], pred_traj_gt[-1])
+            real_abs = torch.cat([obs[:, :, 0, :], pred_gt], dim=0)
+            real_rel = torch.cat([obs_rel[:, :, 0, :], pred_gt_rel], dim=0)
+            fake_seq_abs = torch.cat([obs[:, :, 0, :], fake_abs], dim=0)
+            fake_seq_rel = torch.cat([obs_rel[:, :, 0, :], fake_rel], dim=0)
+            s_real = discriminator(real_abs, real_rel)
+            s_fake = discriminator(fake_seq_abs, fake_seq_rel)
+            d_losses.append(0.5 * (torch.relu(1.0 - s_real).mean() + torch.relu(1.0 + s_fake).mean()).item())
 
-            traj_real = torch.cat([obs_traj[:, :, 0, :], pred_traj_gt], dim=0)
-            traj_real_rel = torch.cat([obs_traj_rel[:, :, 0, :], pred_traj_gt_rel], dim=0)
-            traj_fake = torch.cat([obs_traj[:, :, 0, :], pred_traj_fake], dim=0)
-            traj_fake_rel = torch.cat([obs_traj_rel[:, :, 0, :], pred_traj_fake_rel], dim=0)
-
-            scores_fake = discriminator(traj_fake, traj_fake_rel)
-            scores_real = discriminator(traj_real, traj_real_rel)
-
-            d_loss = d_loss_fn(scores_real, scores_fake)
-            d_losses.append(d_loss.item())
-
-            g_l2_losses_abs.append(g_l2_loss_abs.item())
-            g_l2_losses_rel.append(g_l2_loss_rel.item())
-            disp_error.append(ade.item())
-            f_disp_error.append(fde.item())
-
-            mask_sum += (pred_traj_gt.size(1) * PRED_LEN)
-            total_traj += pred_traj_gt.size(1)
-            if limit and total_traj >= NUM_SAMPLES_CHECK:
+            mask_sum += pred_gt.size(1) * PRED_LEN
+            total += pred_gt.size(1)
+            if limit and total >= NUM_SAMPLES_CHECK:
                 break
 
-    metrics['d_loss'] = sum(d_losses) / len(d_losses)
-    metrics['g_l2_loss_abs'] = sum(g_l2_losses_abs) / mask_sum
-    metrics['g_l2_loss_rel'] = sum(g_l2_losses_rel) / mask_sum
-
-    metrics['ade'] = sum(disp_error) / (total_traj * PRED_LEN)
-    metrics['fde'] = sum(f_disp_error) / total_traj
+    metrics = {
+        'd_loss': sum(d_losses) / len(d_losses),
+        'g_l2_loss_abs': sum(g_l2_abs) / mask_sum,
+        'g_l2_loss_rel': sum(g_l2_rel) / mask_sum,
+        'ade': sum(disp_err) / (total * PRED_LEN),
+        'fde': sum(f_disp_err) / total
+    }
     generator.train()
     return metrics
 
-main()
+if __name__ == '__main__':
+    main()
