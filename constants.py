@@ -11,9 +11,8 @@ NOISE_DIM = 16
 SHARED_MAP_DIR = './img'
 SHARED_MAP_NAME = 'North_shared_map.pkl'
 
-# 'North_AM', , 'North_PM'
 
-DATASET_LIST = ['North_NOON']
+DATASET_LIST = ['North_AM','North_NOON' , 'North_PM']
 NUM_ITERATIONS = 5000
 NUM_EPOCHS = 10
 G_LR = 2e-4

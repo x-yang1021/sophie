@@ -3,7 +3,6 @@ from PIL import Image
 import torch
 import pickle
 
-# Path to your PNG map
 img_path = './img/North_shared_map.png'
 save_path = './img/North_shared_map.pkl'
 

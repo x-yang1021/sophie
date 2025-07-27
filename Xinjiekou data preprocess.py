@@ -5,9 +5,8 @@ import pandas as pd
 from PIL import Image
 from sklearn.model_selection import train_test_split
 import torch
-from constants import *  # Ensure MAP_PATH, DATA_ROOT, etc. are defined here
+from constants import *
 
-# Utility to build the shared scene grid (as before)
 def build_scene_grid(is_north):
     origin = [-474, 52322]
     green = [(-455 - origin[0], 52322 - origin[1]), (-455 - origin[0], 52468 - origin[1])]
@@ -39,14 +38,14 @@ SOPHIE_IMG_ROOT = './img'
 SOPHIE_DATA_ROOT = './datasets'
 STEP = 4                # every 0.4s from 0.1s
 MIN_STEPS = 20          # 20 time steps after subsampling
-HEADING = 1             # 1 = southward
+HEADING = 1             # 1 = southbound
 TIME_PERIODS = ['AM', 'NOON', 'PM']
 
-# Create directories
+
 os.makedirs(SOPHIE_IMG_ROOT, exist_ok=True)
 os.makedirs(SOPHIE_DATA_ROOT, exist_ok=True)
 
-# Generate shared map once (as before)
+
 grid = build_scene_grid(is_north=True)
 img8 = (grid / grid.max() * 255).byte().cpu().numpy()
 rgb = np.stack([img8]*3, axis=2)
@@ -83,7 +82,7 @@ for tp in TIME_PERIODS:
         scenes.append(traj)
 
 
-    print(f"  • Total valid scenes: {len(scenes)}")
+    print(f"Total valid scenes: {len(scenes)}")
     train, temp = train_test_split(scenes, test_size=0.2, random_state=1)
     val, test = train_test_split(temp, test_size=0.5, random_state=1)
     splits = {'train': train, 'val': val, 'test': test}
@@ -98,6 +97,6 @@ for tp in TIME_PERIODS:
                     f.write(f"{t},0,{xx:.4f},{yy:.4f}\n")
         print(f"  • {split_name} set: {len(trajs)} scenes")
 
-print("\n✅ Done! Now update `DATASET_NAME` in `sophie/constants.py` to one of:")
+print("Now update `DATASET_NAME` in `sophie/constants.py` to one of:")
 print("   ", ', '.join([f'North_{tp}' for tp in TIME_PERIODS]))
 print("   and set `MAP_PATH` to:", shared_map_path)
