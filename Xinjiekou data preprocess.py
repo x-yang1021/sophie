@@ -51,9 +51,9 @@ img8 = (grid / grid.max() * 255).byte().cpu().numpy()
 rgb = np.stack([img8]*3, axis=2)
 shared_map_path = os.path.join(SOPHIE_IMG_ROOT, "North_shared_map.png")
 Image.fromarray(rgb).save(shared_map_path)
-print(f"✔ Shared map saved to {shared_map_path}")
+print(f"Shared map saved to {shared_map_path}")
 
-# Process each time period
+
 for tp in TIME_PERIODS:
     print(f"\n→ Processing: North_{tp}")
     data_dir = os.path.join(SOPHIE_DATA_ROOT, f"North_{tp}")
